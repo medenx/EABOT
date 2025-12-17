@@ -127,8 +127,11 @@ int OnInit()
    if(InpFixedLots <= 0) {
        Alert("Error: Lot size invalid!"); return(INIT_PARAMETERS_INCORRECT);
    }
+   if(InpVWAPTolerance <= 0) {
+       Alert("Error: VWAP Tolerance harus > 0"); return(INIT_PARAMETERS_INCORRECT);
+   }
 
-   // 2. Setup Nama File Log (Unik per Simbol & Magic)
+   // 2. Setup Nama File Log (Unik per Simbol & Magic agar Multi-Currency Safe)
    g_log_filename = "Log_VWAP_" + _Symbol + "_" + IntegerToString(InpMagicNum) + ".txt";
 
    // 3. Init Struktur Data
@@ -210,7 +213,8 @@ double CalculateIntradayVWAP(int shift)
     double sum_pv = 0.0;
     double sum_vol = 0.0;
     
-    // Limit loop untuk efisiensi
+    // OPTIMISASI: Limit loop untuk efisiensi CPU pada timeframe kecil
+    // Jangan looping lebih dari 1440 bar (1 hari di M1)
     if(start_bar - curr_bar > 1440) start_bar = curr_bar + 1440; 
 
     for(int i = start_bar; i >= curr_bar; i--) {
@@ -276,6 +280,7 @@ void LogSystem(string msg, bool is_error = false)
 {
     if(!InpUseFileLogging) return;
     
+    // File flag diubah agar bisa append (menambahkan) log baru
     int handle = FileOpen(g_log_filename, FILE_WRITE|FILE_READ|FILE_TXT|FILE_ANSI|FILE_COMMON);
     if(handle != INVALID_HANDLE) {
         FileSeek(handle, 0, SEEK_END);
@@ -295,14 +300,14 @@ void UpdateHealth(bool success)
         g_health.exec_fail++; 
         g_health.consecutive_fails++;
         
-        string err_msg = "Order Failed. Retry: " + IntegerToString(g_health.consecutive_fails);
+        string err_msg = "Order Failed. Retry Sequence: " + IntegerToString(g_health.consecutive_fails);
         LogSystem(err_msg, true);
         
         if(g_health.consecutive_fails > 5) { 
             g_is_broken = true; 
             g_broken_time = GetTickCount();
             
-            string crit_msg = "CRITICAL: Circuit Breaker Activated on " + _Symbol + ". Trading Paused.";
+            string crit_msg = "CRITICAL: Circuit Breaker Activated on " + _Symbol + ". Trading Paused 5 min.";
             LogSystem(crit_msg, true);
             Print(crit_msg);
             
@@ -333,7 +338,7 @@ bool OpenOrderAsync(ENUM_ORDER_TYPE type, double lot, double price, double sl, d
         task.type = type; task.hash = hash; task.timestamp = GetTickCount();
         g_verify_queue.Push(task);
         UpdateHealth(true);
-        LogSystem("Order Executed: " + (string)task.ticket);
+        LogSystem("Order Executed ID: " + (string)task.ticket);
         return true;
     } else {
         OrderTask task;
@@ -356,7 +361,7 @@ void ProcessRetryQueue()
         ulong backoff = 1000 * (1 << MathMin(task.retry_count, 3));
         if(GetTickCount() - task.timestamp >= backoff) {
             
-            // Refresh Price for Retry
+            // Refresh Price for Retry (Penting saat High Volatility)
             double new_price = (task.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
             double new_sl = (InpStopLoss > 0) ? ((task.type == ORDER_TYPE_BUY) ? new_price - (InpStopLoss*cache_point) : new_price + (InpStopLoss*cache_point)) : 0;
             double new_tp = (InpTakeProfit > 0) ? ((task.type == ORDER_TYPE_BUY) ? new_price + (InpTakeProfit*cache_point) : new_price - (InpTakeProfit*cache_point)) : 0;
@@ -402,7 +407,7 @@ void ManageOpenPositions()
             } 
             if(modified) {
                 if(trade.PositionModify(ticket, NormalizeDouble(nsl, _Digits), PositionGetDouble(POSITION_TP)))
-                    LogSystem("Trailing Stop Updated: " + (string)ticket);
+                    LogSystem("Trailing Stop Adjusted for ID: " + (string)ticket);
             }
         } 
     } 
@@ -415,16 +420,20 @@ void ShowDashboard() {
     if(!InpEnableDebug) { Comment(""); return; }
     if(SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) < InpVolPeriod) return;
 
+    // Kalkulasi hanya jika perlu (efisiensi visual)
     double vwap = CalculateIntradayVWAP(1);
+    
     string sys_status = g_is_broken ? "[!] PAUSED" : "[ON] RUNNING";
-    string news_status = (InpUseNewsGuard && IsNewsTime()) ? "[!] NEWS BLOCK ACTIVE" : "No News Filter";
+    string news_status = (InpUseNewsGuard && IsNewsTime()) ? "[!] NEWS BLOCKED" : "[OK] MARKET OPEN";
 
     string text = "=== VWAP INSTITUTIONAL SCALPER v2.4 ===\n";
-    text += "Status        : " + sys_status + "\n";
+    text += "System Status : " + sys_status + "\n";
     text += "News Filter   : " + news_status + "\n";
     text += "Positions     : " + IntegerToString(CountOpenPositions()) + "\n";
+    text += "Queue (R/V)   : " + IntegerToString(g_retry_queue.Count()) + " / " + IntegerToString(g_verify_queue.Count()) + "\n";
     text += "Failures      : " + IntegerToString(g_health.consecutive_fails) + "/5\n";
-    text += "VWAP          : " + DoubleToString(vwap, _Digits) + "\n";
+    text += "--------------------------------\n";
+    text += "VWAP Level    : " + DoubleToString(vwap, _Digits) + "\n";
     Comment(text);
 }
 
@@ -439,6 +448,8 @@ bool IsTradingTimeOptimized() {
 bool IsNewsTime() {
     if(!InpUseNewsGuard) return false;
     MqlDateTime now; TimeCurrent(now);
+    // Logika rentang waktu sederhana (Start <= Hour < End)
+    // Asumsi jam berita ada di hari yang sama.
     return (now.hour >= InpNewsStartHour && now.hour < InpNewsEndHour);
 }
 
@@ -454,7 +465,7 @@ bool CheckFridayClose() {
             if(PositionGetInteger(POSITION_MAGIC) != InpMagicNum) continue;
             has_pos = true;
             trade.PositionClose(ticket);
-            LogSystem("Friday Force Close: " + (string)ticket);
+            LogSystem("Friday Force Close executed: " + (string)ticket);
         }
     }
     return has_pos;
