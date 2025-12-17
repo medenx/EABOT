@@ -1,506 +1,360 @@
 //+------------------------------------------------------------------+
-//|            EA VWAP Institutional Scalper v2.4 (Enhanced)         |
-//|            Based on EA Bot Version 2.3                           |
-//|            Improvements: Validation, Logging, Alerts, News Guard |
+//|                                  VWAP Institutional Scalper v2.5 |
+//|                                     Copyright 2025, Gemini AI    |
+//|                                       For: XAUUSD / Major Pairs  |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2025, Institutional Code (Enhanced)"
+#property copyright "Copyright 2025, Gemini AI"
 #property link      "https://www.mql5.com"
-#property version   "2.4"
+#property version   "2.50"
 #property strict
 
 #include <Trade\Trade.mqh>
-#include <Trade\PositionInfo.mqh>
-#include <Trade\HistoryOrderInfo.mqh>
 
-CTrade trade;
-CPositionInfo positionInfo;
-CHistoryOrderInfo historyOrderInfo;
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                 |
+//+------------------------------------------------------------------+
+input group             "--- Strategy Parameters ---"
+input int               InpVolPeriod      = 20;          // Volume Avg Period
+input double            InpVolMultiplier  = 1.5;         // Volume Spike Multiplier
+input int               InpVWAPResetHour  = 0;           // VWAP Reset Hour (Server Time)
 
-// =================================================================
-// PARAMETER INPUT
-// =================================================================
-input group "=== CORE TRADING ==="
-input int      InpMagicNum          = 889911;
-input int      InpMaxPositions      = 1;
-input double   InpFixedLots         = 0.05; 
+input group             "--- Risk Management (Adaptive) ---"
+input double            InpLots           = 0.01;        // Fixed Lot Size
+input bool              InpUseATR         = true;        // Use ATR for SL/TP?
+input int               InpATRPeriod      = 14;          // ATR Period
+input double            InpATR_SL_Ratio   = 1.5;         // ATR Multiplier for StopLoss
+input double            InpATR_TP_Ratio   = 3.0;         // ATR Multiplier for TakeProfit
+input int               InpFixedSL        = 300;         // Fixed SL (Points) if ATR=false
+input int               InpFixedTP        = 800;         // Fixed TP (Points) if ATR=false
+input int               InpMaxSpread      = 500;         // Max Spread (Points)
+input int               InpSlippage       = 30;          // Max Slippage
 
-input group "=== VWAP STRATEGY ==="
-input double   InpVWAPTolerance     = 1000; // Toleransi jarak (points)
-input double   InpVolMultiplier     = 1.3;  // Min. 1.1
-input int      InpVolPeriod         = 20;   
+input group             "--- Time Filter (Precision) ---"
+input bool              InpUseTimeFilter  = true;
+input int               InpStartHour      = 8;           // Start Hour
+input int               InpStartMinute    = 30;          // Start Minute
+input int               InpEndHour        = 20;          // End Hour
+input int               InpEndMinute      = 0;           // End Minute
 
-input group "=== RISK MANAGEMENT ==="
-input int      InpStopLoss          = 3000; 
-input int      InpTakeProfit        = 8000; 
-input bool     InpUseTrailingStop   = true;
-input int      InpTrailingStart     = 1500; 
-input int      InpTrailingDist      = 500;  
-input int      InpTrailingStep      = 100;
+input group             "--- System Protection ---"
+input int               InpMagicNum       = 123456;      // Magic Number
+input int               InpMaxRetry       = 3;           // Max Order Retries
+input int               InpCircuitBreak   = 5;           // Max Consecutive Errors before Pause
 
-input group "=== TIME & NEWS FILTER ==="
-input bool     InpUseTimeFilter     = true;
-input int      InpStartHour         = 1;    
-input int      InpEndHour           = 23;   
-input bool     InpCloseFriday       = true;
-input int      InpFridayHour        = 20;
-// News Guard Manual (Blokir jam tertentu, misal saat NFP)
-input bool     InpUseNewsGuard      = false; 
-input int      InpNewsStartHour     = 15;   // Jam mulai blokir
-input int      InpNewsEndHour       = 17;   // Jam selesai blokir
-
-input group "=== SYSTEM SAFETY & LOGS ==="
-input int      InpMaxSpread         = 500;  
-input int      InpSlippage          = 100;
-input bool     InpEnableDebug       = true; 
-input bool     InpUseFileLogging    = true; // Simpan log ke file
-input bool     InpUseMobileAlerts   = true; // Kirim notif ke HP saat error kritis
-
-// =================================================================
-// GLOBAL VARIABLES
-// =================================================================
-struct OrderTask {
-    ulong ticket; 
-    ENUM_ORDER_TYPE type;
-    double qty, price, sl, tp;
-    ulong timestamp; 
-    int retry_count; 
-    string hash; 
+//+------------------------------------------------------------------+
+//| STRUCTS & GLOBALS (OPTIMIZATION)                                 |
+//+------------------------------------------------------------------+
+// Struct untuk caching data simbol agar hemat CPU
+struct SSymbolContext
+{
+   double   point;
+   double   tick_size;
+   int      digits;
+   string   symbol;
+   double   ask;
+   double   bid;
+   double   spread_points;
+   
+   void Init(string sym)
+   {
+      symbol      = sym;
+      point       = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      digits      = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      tick_size   = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   }
+   
+   void Refresh()
+   {
+      MqlTick tick;
+      if(SymbolInfoTick(symbol, tick))
+      {
+         ask = tick.ask;
+         bid = tick.bid;
+         if(point > 0) spread_points = (ask - bid) / point;
+      }
+   }
 };
 
-struct HealthMetrics {
-    int exec_success;
-    int exec_fail; 
-    int consecutive_fails;
-};
+CTrade         trade;
+SSymbolContext ctx;
+int            hATR;                // Handle untuk indikator ATR
+int            g_error_count = 0;   // Counter untuk Circuit Breaker
+datetime       g_break_until = 0;   // Waktu sampai kapan pause aktif
 
-class RingBufferOrderTask {
-private: 
-    OrderTask m_buffer[]; 
-    int m_head, m_tail, m_count, m_capacity;
-public:
-    void Init(int capacity) { 
-        ArrayResize(m_buffer, capacity);
-        m_capacity = capacity; 
-        m_head = 0; m_tail = 0; m_count = 0;
-    }
-    bool Push(OrderTask &item) { 
-        if(m_count >= m_capacity) { OrderTask d; Pop(d); } 
-        m_buffer[m_tail] = item; 
-        m_tail = (m_tail + 1) % m_capacity;
-        m_count++; return true; 
-    }
-    bool Pop(OrderTask &item) { 
-        if(m_count <= 0) return false;
-        item = m_buffer[m_head]; 
-        m_head = (m_head + 1) % m_capacity; 
-        m_count--; return true;
-    }
-    int Count() { return m_count; }
-};
-
-bool          g_is_broken = false;
-ulong         g_broken_time = 0;
-HealthMetrics g_health = {0, 0, 0};
-string        g_log_filename;
-
-RingBufferOrderTask g_retry_queue;
-RingBufferOrderTask g_verify_queue;
-double        cache_point;
-
-// Forward declaration
-double CalculateIntradayVWAP(int shift);
-void ShowDashboard();
-void LogSystem(string msg, bool is_error = false);
-
-// =================================================================
-// INITIALIZATION & VALIDATION
-// =================================================================
+//+------------------------------------------------------------------+
+//| EXPERT INITIALIZATION FUNCTION                                   |
+//+------------------------------------------------------------------+
 int OnInit()
 {
-   // 1. VALIDASI PARAMETER (Safety Check)
-   if(InpMagicNum <= 0) {
-       Alert("Error: Magic Number invalid!"); return(INIT_PARAMETERS_INCORRECT);
-   }
-   if(InpVolMultiplier < 1.0) {
-       Alert("Error: Volume Multiplier harus >= 1.0"); return(INIT_PARAMETERS_INCORRECT);
-   }
-   if(InpFixedLots <= 0) {
-       Alert("Error: Lot size invalid!"); return(INIT_PARAMETERS_INCORRECT);
-   }
-   if(InpVWAPTolerance <= 0) {
-       Alert("Error: VWAP Tolerance harus > 0"); return(INIT_PARAMETERS_INCORRECT);
+   // 1. Inisialisasi Context
+   ctx.Init(_Symbol);
+   if(ctx.point == 0) 
+   {
+      Print("Error: Failed to init symbol context.");
+      return(INIT_FAILED);
    }
 
-   // 2. Setup Nama File Log (Unik per Simbol & Magic agar Multi-Currency Safe)
-   g_log_filename = "Log_VWAP_" + _Symbol + "_" + IntegerToString(InpMagicNum) + ".txt";
-
-   // 3. Init Struktur Data
-   g_retry_queue.Init(50); 
-   g_verify_queue.Init(100);
-   
-   if(!RefreshCache()) return(INIT_FAILED);
-
+   // 2. Setup Trade Class
    trade.SetExpertMagicNumber(InpMagicNum);
    trade.SetDeviationInPoints(InpSlippage);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   trade.SetTypeFilling(ORDER_FILLING_IOC); 
 
-   LogSystem("=== SYSTEM STARTED v2.4 (Enhanced) ===");
-   Print("=== VWAP SCALPER XAUUSD V2.4 STARTED ===");
-   
+   // 3. Inisialisasi Indikator ATR (Jika dipakai)
+   if(InpUseATR)
+   {
+      hATR = iATR(_Symbol, _Period, InpATRPeriod);
+      if(hATR == INVALID_HANDLE)
+      {
+         Print("Error: Failed to create ATR handle.");
+         return(INIT_FAILED);
+      }
+   }
+
+   Print("VWAP Institutional Scalper v2.5 Initialized.");
    return(INIT_SUCCEEDED);
 }
 
+//+------------------------------------------------------------------+
+//| EXPERT DEINITIALIZATION FUNCTION                                 |
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   Comment("");
-   LogSystem("=== SYSTEM STOPPED ===");
+   IndicatorRelease(hATR);
+   Print("EA Deinitialized. Reason: ", reason);
 }
 
-// =================================================================
-// ON TICK
-// =================================================================
+//+------------------------------------------------------------------+
+//| EXPERT TICK FUNCTION                                             |
+//+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!RefreshCache()) return;
-
-   // 1. SAFETY: Manage Positions (Always Run)
-   ManageOpenPositions();
-
-   // 2. Friday Close Logic
-   if(CheckFridayClose()) { ShowDashboard(); return; }
+   // --- 1. Refresh Data Pasar (Ringan) ---
+   ctx.Refresh();
    
-   // 3. Process Queues
-   ProcessVerifyQueue(); 
-   ProcessRetryQueue();
+   // --- 2. Cek Circuit Breaker (Safety) ---
+   if(TimeCurrent() < g_break_until) return; // Sedang dalam masa hukuman (pause)
+   
+   // --- 3. Filter Spread & Time ---
+   if(ctx.spread_points > InpMaxSpread) return;
+   if(!IsTradingAllowedByTime()) return;
+   
+   // --- 4. Logic: Cek Posisi Terbuka ---
+   if(PositionSelectByMagic()) return; // Satu posisi pada satu waktu
+   
+   // --- 5. Kalkulasi Sinyal ---
+   double vwap = CalculateIntradayVWAP();
+   bool isVolSpike = IsVolumeSpike();
+   
+   // Kondisi Trading Sederhana (Contoh Logika VWAP)
+   // Buy: Harga Close di atas VWAP + Volume Spike
+   // Sell: Harga Close di bawah VWAP + Volume Spike
+   
+   double close = iClose(_Symbol, _Period, 1);
+   
+   if(isVolSpike && close > vwap)
+   {
+      ExecuteTrade(ORDER_TYPE_BUY);
+   }
+   else if(isVolSpike && close < vwap)
+   {
+      ExecuteTrade(ORDER_TYPE_SELL);
+   }
+}
 
-   // 4. Circuit Breaker Handler
-   if(g_is_broken) {
-      if(GetTickCount() - g_broken_time > 300000) { // 5 menit
-         g_is_broken = false;
-         g_health.consecutive_fails = 0; 
-         LogSystem("System Recovered from Circuit Breaker.");
+//+------------------------------------------------------------------+
+//| HELPER: Execution Logic with Adaptive SL/TP                      |
+//+------------------------------------------------------------------+
+void ExecuteTrade(ENUM_ORDER_TYPE type)
+{
+   // Reset error count jika berhasil masuk logika order
+   int sl_points = 0;
+   int tp_points = 0;
+   
+   // A. Hitung Dynamic SL/TP
+   GetAdaptiveSLTP(sl_points, tp_points);
+   
+   double price = (type == ORDER_TYPE_BUY) ? ctx.ask : ctx.bid;
+   double sl    = (type == ORDER_TYPE_BUY) ? price - (sl_points * ctx.point) : price + (sl_points * ctx.point);
+   double tp    = (type == ORDER_TYPE_BUY) ? price + (tp_points * ctx.point) : price - (tp_points * ctx.point);
+   
+   // Normalisasi harga agar valid
+   price = NormalizeDouble(price, ctx.digits);
+   sl    = NormalizeDouble(sl, ctx.digits);
+   tp    = NormalizeDouble(tp, ctx.digits);
+   
+   // B. Kirim Order dengan Retry Logic
+   bool res = false;
+   for(int i=0; i<InpMaxRetry; i++)
+   {
+      if(type == ORDER_TYPE_BUY) res = trade.Buy(InpLots, _Symbol, price, sl, tp, "VWAP v2.5 Buy");
+      else                       res = trade.Sell(InpLots, _Symbol, price, sl, tp, "VWAP v2.5 Sell");
+      
+      if(res) 
+      {
+         g_error_count = 0; // Reset error counter jika sukses
+         break; 
       }
-      ShowDashboard();
+      else
+      {
+         Print("Order failed. Retrying... Error: ", GetLastError());
+         Sleep(100); // Backoff delay kecil
+         ctx.Refresh(); // Refresh harga sebelum retry
+         price = (type == ORDER_TYPE_BUY) ? ctx.ask : ctx.bid; // Update harga
+      }
+   }
+   
+   // C. Handle Circuit Breaker jika gagal total
+   if(!res)
+   {
+      g_error_count++;
+      if(g_error_count >= InpCircuitBreak)
+      {
+         Print("CRITICAL: Circuit Breaker Triggered! Pausing for 1 hour.");
+         g_break_until = TimeCurrent() + 3600; // Pause 1 jam
+         g_error_count = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| HELPER: Adaptive SL/TP Calculation                               |
+//+------------------------------------------------------------------+
+void GetAdaptiveSLTP(int &sl_p, int &tp_p)
+{
+   if(!InpUseATR)
+   {
+      sl_p = InpFixedSL;
+      tp_p = InpFixedTP;
       return;
    }
-
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
-
-   ShowDashboard();
-
-   // 5. Entry Filters
-   if(!IsNewBar()) return;
-   if(InpUseTimeFilter && !IsTradingTimeOptimized()) return;
-   if(InpUseNewsGuard && IsNewsTime()) return; // Filter News Manual
-   if(CountOpenPositions() >= InpMaxPositions) return;
-   if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > InpMaxSpread) return;
-
-   // 6. Signal Processing
-   ProcessSignal();
-}
-
-// =================================================================
-// CORE STRATEGY
-// =================================================================
-double CalculateIntradayVWAP(int shift)
-{
-    datetime time_curr = iTime(_Symbol, _Period, shift);
-    datetime time_start = time_curr - (time_curr % 86400); 
-    
-    int start_bar = iBarShift(_Symbol, _Period, time_start);
-    int curr_bar = iBarShift(_Symbol, _Period, time_curr);
-    
-    double sum_pv = 0.0;
-    double sum_vol = 0.0;
-    
-    // OPTIMISASI: Limit loop untuk efisiensi CPU pada timeframe kecil
-    // Jangan looping lebih dari 1440 bar (1 hari di M1)
-    if(start_bar - curr_bar > 1440) start_bar = curr_bar + 1440; 
-
-    for(int i = start_bar; i >= curr_bar; i--) {
-        double price = (iHigh(_Symbol, _Period, i) + iLow(_Symbol, _Period, i) + iClose(_Symbol, _Period, i)) / 3.0;
-        long vol = iVolume(_Symbol, _Period, i); 
-        if(vol > 0) {
-            sum_pv += price * (double)vol;
-            sum_vol += (double)vol;
-        }
-    }
-    return (sum_vol == 0) ? 0 : sum_pv / sum_vol;
-}
-
-bool IsVolumeSpike(int shift)
-{
-    long curr_vol = iVolume(_Symbol, _Period, shift);
-    double sum_vol = 0;
-    for(int i = shift + 1; i <= shift + InpVolPeriod; i++) {
-        sum_vol += (double)iVolume(_Symbol, _Period, i);
-    }
-    double avg_vol = sum_vol / InpVolPeriod;
-    return (avg_vol > 0 && (double)curr_vol > (avg_vol * InpVolMultiplier));
-}
-
-void ProcessSignal()
-{
-   int shift = 1;
-   double vwap = CalculateIntradayVWAP(shift);
-   if(vwap == 0) return;
    
-   double close = iClose(_Symbol, _Period, shift);
-   double high = iHigh(_Symbol, _Period, shift);
-   double low = iLow(_Symbol, _Period, shift);
-   double tol = InpVWAPTolerance * cache_point;
+   double atr_val[];
+   ArraySetAsSeries(atr_val, true);
    
-   int signal = 0;
-   
-   // Logic Buy (Rejection Low at VWAP)
-   if(low <= (vwap + tol) && close > vwap) {
-       if(IsVolumeSpike(shift)) signal = 1;
-   }
-   // Logic Sell (Rejection High at VWAP)
-   else if(high >= (vwap - tol) && close < vwap) {
-       if(IsVolumeSpike(shift)) signal = -1;
+   if(CopyBuffer(hATR, 0, 1, 1, atr_val) < 1) // Copy ATR bar terakhir (closed)
+   {
+      Print("Warning: ATR Copy failed, using fixed SL/TP");
+      sl_p = InpFixedSL;
+      tp_p = InpFixedTP;
+      return;
    }
    
-   if(signal == 0) return;
+   // Konversi Nilai ATR ke Points
+   int atr_points = (int)(atr_val[0] / ctx.point);
    
-   double price = (signal == 1) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   ENUM_ORDER_TYPE type = (signal == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   sl_p = (int)(atr_points * InpATR_SL_Ratio);
+   tp_p = (int)(atr_points * InpATR_TP_Ratio);
    
-   double sl = (InpStopLoss > 0) ? ((signal == 1) ? price - (InpStopLoss*cache_point) : price + (InpStopLoss*cache_point)) : 0;
-   double tp = (InpTakeProfit > 0) ? ((signal == 1) ? price + (InpTakeProfit*cache_point) : price - (InpTakeProfit*cache_point)) : 0;
-
-   string hash = StringFormat("%d_%.5f_%d", type, price, TimeCurrent());
-   OpenOrderAsync(type, InpFixedLots, price, sl, tp, hash);
+   // Safety check: Jangan biarkan SL/TP bernilai 0 atau negatif
+   if(sl_p <= 0) sl_p = InpFixedSL;
+   if(tp_p <= 0) tp_p = InpFixedTP;
 }
 
-// =================================================================
-// UTILITIES (LOGGING & ALERTS)
-// =================================================================
-void LogSystem(string msg, bool is_error = false)
+//+------------------------------------------------------------------+
+//| HELPER: Time Filter (Precision Minutes)                          |
+//+------------------------------------------------------------------+
+bool IsTradingAllowedByTime()
 {
-    if(!InpUseFileLogging) return;
-    
-    // File flag diubah agar bisa append (menambahkan) log baru
-    int handle = FileOpen(g_log_filename, FILE_WRITE|FILE_READ|FILE_TXT|FILE_ANSI|FILE_COMMON);
-    if(handle != INVALID_HANDLE) {
-        FileSeek(handle, 0, SEEK_END);
-        string time = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
-        string type = is_error ? "[ERROR]" : "[INFO]";
-        FileWrite(handle, time + " " + type + " " + msg);
-        FileClose(handle);
-    }
+   if(!InpUseTimeFilter) return(true);
+
+   MqlDateTime dt;
+   TimeCurrent(dt); 
+
+   // Konversi semua ke total menit dari 00:00
+   int current_min = (dt.hour * 60) + dt.min;
+   int start_min   = (InpStartHour * 60) + InpStartMinute;
+   int end_min     = (InpEndHour * 60) + InpEndMinute;
+
+   // Logika Normal (contoh: 08:00 - 20:00)
+   if(start_min < end_min)
+   {
+      if(current_min >= start_min && current_min < end_min) return(true);
+   }
+   // Logika Lintas Hari (contoh: 22:00 - 02:00)
+   else 
+   {
+      if(current_min >= start_min || current_min < end_min) return(true);
+   }
+
+   return(false);
 }
 
-void UpdateHealth(bool success) 
-{ 
-    if(success) { 
-        g_health.exec_success++; 
-        g_health.consecutive_fails = 0;
-    } else { 
-        g_health.exec_fail++; 
-        g_health.consecutive_fails++;
-        
-        string err_msg = "Order Failed. Retry Sequence: " + IntegerToString(g_health.consecutive_fails);
-        LogSystem(err_msg, true);
-        
-        if(g_health.consecutive_fails > 5) { 
-            g_is_broken = true; 
-            g_broken_time = GetTickCount();
-            
-            string crit_msg = "CRITICAL: Circuit Breaker Activated on " + _Symbol + ". Trading Paused 5 min.";
-            LogSystem(crit_msg, true);
-            Print(crit_msg);
-            
-            if(InpUseMobileAlerts) SendNotification(crit_msg);
-        }
-    } 
-}
-
-// =================================================================
-// EXECUTION & SAFETY
-// =================================================================
-bool OpenOrderAsync(ENUM_ORDER_TYPE type, double lot, double price, double sl, double tp, string hash)
+//+------------------------------------------------------------------+
+//| HELPER: Calculate Intraday VWAP                                  |
+//+------------------------------------------------------------------+
+double CalculateIntradayVWAP()
 {
-    if(lot <= 0) return false;
-    double margin_required = 0.0;
-    if(!OrderCalcMargin(type, _Symbol, lot, price, margin_required)) return false;
-    if(AccountInfoDouble(ACCOUNT_MARGIN_FREE) < margin_required) return false;
-    
-    bool result = false;
-    string comment = "VWAP_v2.4";
-    
-    if(type == ORDER_TYPE_BUY) result = trade.Buy(lot, _Symbol, price, sl, tp, comment);
-    else if(type == ORDER_TYPE_SELL) result = trade.Sell(lot, _Symbol, price, sl, tp, comment);
-    
-    if(result && trade.ResultRetcode() == TRADE_RETCODE_DONE) {
-        OrderTask task;
-        task.ticket = trade.ResultOrder();
-        task.type = type; task.hash = hash; task.timestamp = GetTickCount();
-        g_verify_queue.Push(task);
-        UpdateHealth(true);
-        LogSystem("Order Executed ID: " + (string)task.ticket);
-        return true;
-    } else {
-        OrderTask task;
-        task.type = type; task.qty = lot;
-        task.price = price; task.sl = sl; task.tp = tp;
-        task.hash = hash; task.timestamp = GetTickCount(); task.retry_count = 0;
-        g_retry_queue.Push(task);
-        UpdateHealth(false);
-        return false;
-    }
+   // Loop sederhana untuk mendapatkan start bar hari ini
+   int start_bar = 0;
+   MqlDateTime dt;
+   
+   // Cari bar pertama hari ini (reset hour)
+   // Optimasi: Jangan loop lebih dari 1440 (untuk M1)
+   for(int i=0; i<1440; i++)
+   {
+      datetime time = iTime(_Symbol, _Period, i);
+      TimeToStruct(time, dt);
+      if(dt.hour == InpVWAPResetHour && dt.min == 0)
+      {
+         start_bar = i;
+         break;
+      }
+   }
+   
+   double sum_pv = 0;
+   double sum_v  = 0;
+   
+   // Hitung VWAP dari start_bar sampai bar 1 (bar 0 sedang berjalan)
+   for(int k=start_bar; k>=1; k--)
+   {
+      long vol = iVolume(_Symbol, _Period, k);
+      double price = (iHigh(_Symbol, _Period, k) + iLow(_Symbol, _Period, k) + iClose(_Symbol, _Period, k)) / 3.0;
+      
+      sum_pv += price * vol;
+      sum_v  += vol;
+   }
+   
+   if(sum_v == 0) return(iClose(_Symbol, _Period, 1));
+   return(sum_pv / sum_v);
 }
 
-void ProcessRetryQueue()
+//+------------------------------------------------------------------+
+//| HELPER: Volume Spike Detection                                   |
+//+------------------------------------------------------------------+
+bool IsVolumeSpike()
 {
-    int processed = 0;
-    while(processed < 3 && g_retry_queue.Count() > 0) { 
-        OrderTask task;
-        if(!g_retry_queue.Pop(task)) break;
-        
-        ulong backoff = 1000 * (1 << MathMin(task.retry_count, 3));
-        if(GetTickCount() - task.timestamp >= backoff) {
-            
-            // Refresh Price for Retry (Penting saat High Volatility)
-            double new_price = (task.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            double new_sl = (InpStopLoss > 0) ? ((task.type == ORDER_TYPE_BUY) ? new_price - (InpStopLoss*cache_point) : new_price + (InpStopLoss*cache_point)) : 0;
-            double new_tp = (InpTakeProfit > 0) ? ((task.type == ORDER_TYPE_BUY) ? new_price + (InpTakeProfit*cache_point) : new_price - (InpTakeProfit*cache_point)) : 0;
-
-            if(!OpenOrderAsync(task.type, task.qty, new_price, new_sl, new_tp, task.hash)) {
-                task.retry_count++;
-                task.timestamp = GetTickCount();
-                if(task.retry_count <= 3) g_retry_queue.Push(task);
-            }
-        } else {
-            g_retry_queue.Push(task);
-        }
-        processed++;
-    }
+   long current_vol = iVolume(_Symbol, _Period, 0);
+   
+   // Hitung rata-rata volume masa lalu (index 1 ke InpVolPeriod)
+   double sum_vol = 0;
+   for(int i=1; i<=InpVolPeriod; i++)
+   {
+      sum_vol += iVolume(_Symbol, _Period, i);
+   }
+   double avg_vol = sum_vol / InpVolPeriod;
+   
+   if(avg_vol == 0) return(false);
+   
+   // Apakah volume sekarang > rata-rata * multiplier?
+   return (current_vol > avg_vol * InpVolMultiplier);
 }
 
-void ManageOpenPositions() 
-{ 
-    if(!InpUseTrailingStop) return;
-    double st = InpTrailingStart * cache_point;
-    double dt = InpTrailingDist * cache_point;
-    double sp = InpTrailingStep * cache_point;
-
-    for(int i = PositionsTotal() - 1; i >= 0; i--) { 
-        ulong ticket = PositionGetTicket(i);
-        if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == InpMagicNum) { 
-            double sl = PositionGetDouble(POSITION_SL);
-            double cr = PositionGetDouble(POSITION_PRICE_CURRENT);
-            double op = PositionGetDouble(POSITION_PRICE_OPEN);
-            double nsl = sl;
-            bool modified = false;
-
-            if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) { 
-                if(cr - op > st) { 
-                    double target = cr - dt;
-                    if(target > sl + sp) { nsl = target; modified = true; } 
-                } 
-            } else { 
-                if(op - cr > st) { 
-                    double target = cr + dt;
-                    if(target < sl - sp || sl == 0) { nsl = target; modified = true; } 
-                } 
-            } 
-            if(modified) {
-                if(trade.PositionModify(ticket, NormalizeDouble(nsl, _Digits), PositionGetDouble(POSITION_TP)))
-                    LogSystem("Trailing Stop Adjusted for ID: " + (string)ticket);
-            }
-        } 
-    } 
-}
-
-// =================================================================
-// HELPERS
-// =================================================================
-void ShowDashboard() {
-    if(!InpEnableDebug) { Comment(""); return; }
-    if(SeriesInfoInteger(_Symbol, _Period, SERIES_BARS_COUNT) < InpVolPeriod) return;
-
-    // Kalkulasi hanya jika perlu (efisiensi visual)
-    double vwap = CalculateIntradayVWAP(1);
-    
-    string sys_status = g_is_broken ? "[!] PAUSED" : "[ON] RUNNING";
-    string news_status = (InpUseNewsGuard && IsNewsTime()) ? "[!] NEWS BLOCKED" : "[OK] MARKET OPEN";
-
-    string text = "=== VWAP INSTITUTIONAL SCALPER v2.4 ===\n";
-    text += "System Status : " + sys_status + "\n";
-    text += "News Filter   : " + news_status + "\n";
-    text += "Positions     : " + IntegerToString(CountOpenPositions()) + "\n";
-    text += "Queue (R/V)   : " + IntegerToString(g_retry_queue.Count()) + " / " + IntegerToString(g_verify_queue.Count()) + "\n";
-    text += "Failures      : " + IntegerToString(g_health.consecutive_fails) + "/5\n";
-    text += "--------------------------------\n";
-    text += "VWAP Level    : " + DoubleToString(vwap, _Digits) + "\n";
-    Comment(text);
-}
-
-bool IsTradingTimeOptimized() {
-    MqlDateTime now; TimeCurrent(now);
-    if(now.day_of_week == 6 || now.day_of_week == 0) return false;
-    int ch = now.hour;
-    if(InpStartHour <= InpEndHour) return (ch >= InpStartHour && ch < InpEndHour);
-    else return (ch >= InpStartHour || ch < InpEndHour);
-}
-
-bool IsNewsTime() {
-    if(!InpUseNewsGuard) return false;
-    MqlDateTime now; TimeCurrent(now);
-    // Logika rentang waktu sederhana (Start <= Hour < End)
-    // Asumsi jam berita ada di hari yang sama.
-    return (now.hour >= InpNewsStartHour && now.hour < InpNewsEndHour);
-}
-
-bool CheckFridayClose() {
-    if(!InpCloseFriday) return false;
-    MqlDateTime now; TimeCurrent(now);
-    if(now.day_of_week != 5 || now.hour < InpFridayHour) return false;
-    
-    bool has_pos = false;
-    for(int i = PositionsTotal() - 1; i >= 0; i--) {
-        ulong ticket = PositionGetTicket(i);
-        if(PositionSelectByTicket(ticket)) {
-            if(PositionGetInteger(POSITION_MAGIC) != InpMagicNum) continue;
-            has_pos = true;
-            trade.PositionClose(ticket);
-            LogSystem("Friday Force Close executed: " + (string)ticket);
-        }
-    }
-    return has_pos;
-}
-
-void ProcessVerifyQueue() { 
-    int x = 0;
-    while(x < 10 && g_verify_queue.Count() > 0) { 
-        OrderTask t; 
-        if(!g_verify_queue.Pop(t)) break;
-        if(GetTickCount() - t.timestamp < 10000 && !PositionSelectByTicket(t.ticket)) 
-            g_verify_queue.Push(t);
-        x++; 
-    } 
-}
-
-bool RefreshCache() { 
-    cache_point = SymbolInfoDouble(_Symbol, SYMBOL_POINT); 
-    return (cache_point > 0);
-}
-
-bool IsNewBar() { 
-    static datetime last_bar_time = 0;
-    datetime current_bar_time = iTime(_Symbol, _Period, 0);
-    if(last_bar_time != current_bar_time) { 
-        last_bar_time = current_bar_time; 
-        return true; 
-    } 
-    return false;
-}
-
-int CountOpenPositions() { 
-    int count = 0;
-    for(int i = PositionsTotal() - 1; i >= 0; i--) {
-        if(PositionGetInteger(POSITION_MAGIC) == InpMagicNum) count++;
-    }
-    return count; 
+//+------------------------------------------------------------------+
+//| HELPER: Check Existing Positions                                 |
+//+------------------------------------------------------------------+
+bool PositionSelectByMagic()
+{
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNum && 
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+         {
+            return(true);
+         }
+      }
+   }
+   return(false);
 }
