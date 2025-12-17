@@ -474,3 +474,4 @@ bool IsNewBar() { static datetime l=0; datetime c=iTime(_Symbol,_Period,0); if(l
 bool IsTradingTimeOptimized() { MqlDateTime n; TimeCurrent(n); if(n.day_of_week==6||n.day_of_week==0) return false; if(InpStartHour<=InpEndHour) return (n.hour>=InpStartHour && n.hour<InpEndHour); else return (n.hour>=InpStartHour || n.hour<InpEndHour); }
 int CountOpenPositions() { int c=0; for(int i=PositionsTotal()-1; i>=0; i--) { ulong t=PositionGetTicket(i); if(t>0 && PositionGetInteger(POSITION_MAGIC)==InpMagicNum) c++; } return c; }
 //+------------------------------------------------------------------+
+
