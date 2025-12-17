@@ -1,0 +1,67 @@
+; EA Bot Version 2.0 - USDJPY M15 Preset (The Ninja)
+; Save this file as USDJPY_M15.set
+
+; === INTELLIGENCE CORE (V2.0) ===
+; Mode Auto: 1 = MODE_AUTO_ATR
+InpStratMode=1
+; Timeframe H1 (16385) untuk filter tren utama
+InpTrendTF=16385
+InpATR_Switch_Period=14
+; Threshold 0.08 (8 pips) karena UJ volatilitasnya lebih rendah
+InpATR_Switch_Level=0.08
+
+; === MONEY MANAGEMENT ===
+InpUseDynamicLot=1
+; Risiko 1% per trade (Konservatif/Standard)
+InpRiskPercent=1.0
+InpFixedLots=0.02
+
+; === DYNAMIC SL/TP ===
+InpUseATR_SLTP=1
+InpATR_SLTP_Period=14
+; SL 1.5x ATR (Cukup ketat untuk UJ)
+InpATR_SL_Ratio=1.5
+; TP 3.5x ATR (Menangkap swing menengah)
+InpATR_TP_Ratio=3.5
+
+; === CORE SETTINGS ===
+; Magic Number BEDA dengan GBPJPY agar tidak bentrok
+InpMagicNum=445566
+InpMaxPositions=1
+
+; === TIME FILTER ===
+InpUseTimeFilter=1
+; Mulai jam 02:00 Server (Menangkap Open Market Tokyo)
+InpStartHour=2
+; Berhenti jam 20:00 (Akhir sesi New York)
+InpEndHour=20
+InpCloseFriday=1
+InpFridayHour=21
+
+; === STRATEGY PARAMETERS ===
+InpMAPeriod=50
+InpADXPeriod=14
+; ADX 20.0 (Lebih rendah agar tidak telat masuk tren pelan)
+InpADXThreshold=20.0
+InpRSIPeriod=14
+InpStochK=8
+InpStochD=3
+InpStochSlowing=3
+InpStochUpper=80
+InpStochLower=20
+
+; === RISK FALLBACK ===
+; Nilai poin cadangan jika ATR gagal (5 digit broker)
+InpStopLossFixed=5000
+InpTakeProfitFixed=10000
+InpUseTrailingStop=1
+InpTrailingStart=200
+InpTrailingDist=200
+InpTrailingStep=50
+
+; === SYSTEM SAFETY ===
+; Spread max 25 poin (2.5 pips) - UJ biasanya spread tipis
+InpMaxSpread=25
+InpSlippage=50
+InpMaxRetryAttempts=5
+InpEnableDebug=1

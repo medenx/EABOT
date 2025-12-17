@@ -1,0 +1,70 @@
+; EA Bot Version 2.0 - EURUSD M15 Preset (The Liquid King)
+; Save this file as EURUSD_M15.set
+
+; === INTELLIGENCE CORE (V2.0) ===
+; Mode Auto: 1 = MODE_AUTO_ATR
+InpStratMode=1
+; Trend Filter H1 (16385)
+InpTrendTF=16385
+InpATR_Switch_Period=14
+; Threshold 0.0006 (6 pips). 
+; EURUSD sering bergerak halus, jadi threshold dibuat sensitif (6 pips)
+; Di atas 6 pips per candle dianggap Trending, di bawah itu Sideways (Scalping).
+InpATR_Switch_Level=0.0006
+
+; === MONEY MANAGEMENT ===
+InpUseDynamicLot=1
+; Risiko 1.0% (Konservatif karena pair ini stabil)
+InpRiskPercent=1.0
+InpFixedLots=0.02
+
+; === DYNAMIC SL/TP ===
+InpUseATR_SLTP=1
+InpATR_SLTP_Period=14
+; SL 1.5x ATR (Standar untuk pair stabil)
+InpATR_SL_Ratio=1.5
+; TP 3.0x ATR (Risk:Reward 1:2)
+InpATR_TP_Ratio=3.0
+
+; === CORE SETTINGS ===
+; Magic Number UNIK untuk EURUSD
+InpMagicNum=111222
+InpMaxPositions=1
+
+; === TIME FILTER ===
+InpUseTimeFilter=1
+; Mulai jam 08:00 Server (Open London)
+InpStartHour=8
+; Berhenti jam 21:00 (Akhir sesi New York / Overlap Selesai)
+InpEndHour=21
+InpCloseFriday=1
+InpFridayHour=21
+
+; === STRATEGY PARAMETERS ===
+InpMAPeriod=50
+InpADXPeriod=14
+; ADX 22.0 (Filter kekuatan tren standar)
+InpADXThreshold=22.0
+InpRSIPeriod=14
+InpStochK=8
+InpStochD=3
+InpStochSlowing=3
+InpStochUpper=80
+InpStochLower=20
+
+; === RISK FALLBACK ===
+; Nilai poin cadangan (5 digit broker)
+InpStopLossFixed=4000
+InpTakeProfitFixed=8000
+InpUseTrailingStop=1
+InpTrailingStart=200
+InpTrailingDist=200
+InpTrailingStep=50
+
+; === SYSTEM SAFETY ===
+; Spread max 20 poin (2.0 pips) - EURUSD biasanya spread sangat tipis (0-1 pips)
+InpMaxSpread=20
+; Slippage standar
+InpSlippage=50
+InpMaxRetryAttempts=5
+InpEnableDebug=1
