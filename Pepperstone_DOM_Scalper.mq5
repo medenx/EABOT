@@ -1,44 +1,58 @@
 //+------------------------------------------------------------------+
-//|                                   Pepperstone_DOM_Scalper_V3.2.mq5 |
-//|                        Copyright 2025, Specialized for Pepperstone|
-//|                                          MetaTrader 5 MQL5       |
+//|                                   Pepperstone_DOM_Scalper_V4.1.mq5 |
+//|                        Copyright 2025, Specialized for M1 Scalping|
+//|                                     "The Golden Master Version"  |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Gemini AI"
 #property link      "https://www.pepperstone.com"
-#property version   "3.20"
+#property version   "4.10"
 #property strict
 
 #include <Trade\Trade.mqh>
 
-//--- Input Parameters
+//--- INPUT PARAMETERS ---
 input group "=== Money Management ==="
-input double InpLotSize    = 0.01;      // Lot Size (Konservatif)
-input int    InpStopLoss   = 250;       // Stop Loss (Points)
-input int    InpTakeProfit = 500;       // Take Profit (Points)
+input bool   InpUseAutoLot = true;
+input double InpRiskPercent = 1.0;
+input double InpFixedLot   = 0.01;
+input int    InpStopLoss   = 200;       // Stop Loss (Points)
+input int    InpTakeProfit = 400;       // Take Profit (Points)
 
-input group "=== Strategy Filters ==="
-input double InpDomRatio   = 3.0;       // Rasio Kekuatan DOM (Buy:Sell)
-input int    InpEmaPeriod  = 100;       // Filter Tren EMA (Konservatif)
-input long   InpMinTickVol = 50;        // Minimal Tick Volume
-input int    InpMaxSpread  = 15;        // Maksimal Spread (Points)
+input group "=== M1 STRATEGY (MTF LOGIC) ==="
+input ENUM_TIMEFRAMES InpTrendTF = PERIOD_M5; // Acuan Tren (Master)
+input int    InpEmaPeriod  = 50;        // Periode EMA Master
+input bool   InpUseEmaSlope= true;      // Filter Kemiringan EMA
 
-input group "=== System ==="
-input bool   InpUseRandomMagic = true;  // True = Magic Number Acak setiap restart
+input group "=== DOM Execution (M1) ==="
+input double InpDomRatio   = 2.5;       // Rasio Eksekusi
+input int    InpMaxSpread  = 20;        // Maksimal Spread
+input int    InpSlippage   = 50;        // Toleransi Slippage
 
-//--- Global Variables
+input group "=== Volume Filter (RVOL) ==="
+input bool   InpUseVolFilter = true;
+input int    InpVolBaseline  = 50;      // Rata-rata 50 Candle
+input int    InpVolThreshold = 80;      // Minimal aktivitas 80%
+
+input group "=== System Info ==="
+input int    InpMagicNumber = 999011;
+input string InpComment     = "DOM_V4.1_Final";
+
+//--- GLOBAL VARIABLES ---
 CTrade         trade;
-long           magicNumber;
-string         eaComment = "DOM_V3.2_GoldMaster";
 bool           isDomSubscribed = false;
 MqlBookInfo    bookInfo[];
 int            handleEMA;
 datetime       lastBarTime = 0;
+datetime       lastDashUpdate = 0;
+ulong          executionCooldown = 0;   // VARIABEL ANTI-SPAM
 
-//--- Variabel Dashboard
-string         statusMsg = "System Ready";
+//--- DASHBOARD VARS ---
+string         statusMsg = "System Booting...";
+string         dashTrendStatus = "Waiting...";
+string         dashSlopeStatus = "Flat";
 double         dashBuyVol = 0;
 double         dashSellVol = 0;
-string         dashTrend = "Computing...";
+double         dashVolPercent = 0;
 int            orphanTrades = 0;
 
 //+------------------------------------------------------------------+
@@ -46,33 +60,23 @@ int            orphanTrades = 0;
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   // 1. Logic Magic Number
-   if(InpUseRandomMagic) {
-      MathSrand(GetTickCount());
-      magicNumber = MathRand();
-   } else {
-      magicNumber = 123456; 
-   }
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetMarginMode();
    
-   // 2. Setup Trade Class
-   trade.SetExpertMagicNumber(magicNumber);
-   trade.SetDeviationInPoints(10);
+   // Safety: Validasi Input
+   if(InpVolBaseline < 10) { Print("INIT ERROR: Baseline Volume min 10"); return(INIT_FAILED); }
+   if(InpStopLoss < 10 || InpTakeProfit < 10) { Print("INIT ERROR: SL/TP Terlalu Kecil"); return(INIT_FAILED); }
    
-   // FIX: Auto-Detect Filling Mode
-   if(!SetFillingMode()) {
-      Print("CRITICAL: Gagal setting Filling Mode.");
-      return(INIT_FAILED);
-   }
+   // Filling Mode Detection
+   if(!SetFillingMode()) { Print("INIT ERROR: Filling Mode Failed"); return(INIT_FAILED); }
    
-   // 3. Subscribe DOM
-   if(!MarketBookAdd(_Symbol)) {
-      Print("FATAL: Gagal subscribe DOM Level 2");
-      return(INIT_FAILED);
-   }
+   // Subscribe DOM
+   if(!MarketBookAdd(_Symbol)) { Print("FATAL: Broker tidak support DOM Level 2"); return(INIT_FAILED); }
    isDomSubscribed = true;
    
-   // 4. Init EMA
-   handleEMA = iMA(_Symbol, PERIOD_M1, InpEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   // Init EMA (MTF)
+   handleEMA = iMA(_Symbol, InpTrendTF, InpEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
    if(handleEMA == INVALID_HANDLE) return(INIT_FAILED);
    
    return(INIT_SUCCEEDED);
@@ -93,176 +97,245 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
-   // --- 1. SYSTEM CHECK ---
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) { 
-      statusMsg = "AutoTrading Disabled!"; DisplayDashboard(); return; 
+   // --- 1. SAFETY & ANTI-SPAM CHECK ---
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED) || !SymbolInfoInteger(_Symbol, SYMBOL_TIME)) return;
+   
+   // [ANTI-SPAM] Jika sedang cooldown, skip tick ini
+   if(GetTickCount() < executionCooldown) return;
+
+   // --- 2. DATA PREPARATION ---
+   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   
+   // --- 3. VOLUME ANALYSIS (M1) ---
+   if(Bars(_Symbol, PERIOD_CURRENT) < InpVolBaseline + 5) {
+       statusMsg = "Waiting History Data..."; UpdateDashboard(); return;
    }
    
-   long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   long tickVol = iVolume(_Symbol, PERIOD_M1, 0);
+   long sumLong = 0;
+   for(int i=1; i<=InpVolBaseline; i++) sumLong += iVolume(_Symbol, PERIOD_CURRENT, i);
+   long baselineVol = sumLong / InpVolBaseline;
    
-   orphanTrades = CountOrphanPositions();
+   long sumShort = 0;
+   for(int i=1; i<=3; i++) sumShort += iVolume(_Symbol, PERIOD_CURRENT, i);
+   long currentVol = sumShort / 3;
+   
+   dashVolPercent = (baselineVol > 0) ? ((double)currentVol / baselineVol * 100.0) : 0;
 
-   // --- 2. EMA DATA ---
+   // --- 4. TREND ANALYSIS (MTF - M5) ---
    double emaVal[];
    ArraySetAsSeries(emaVal, true);
-   if(CopyBuffer(handleEMA, 0, 0, 1, emaVal) != 1) {
-      statusMsg = "Waiting for EMA Data...";
-      DisplayDashboard();
-      return;
+   
+   // Sinkronisasi Data M5
+   if(CopyBuffer(handleEMA, 0, 0, 3, emaVal) != 3) {
+       statusMsg = "Syncing M5 Trend..."; UpdateDashboard(); return;
    }
    
-   bool isUptrend = bid > emaVal[0];
-   bool isDowntrend = bid < emaVal[0];
-   dashTrend = isUptrend ? "BULLISH (Buy Zone)" : "BEARISH (Sell Zone)";
+   double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool isPriceAbove = currentBid > emaVal[0];
+   bool isSlopeUp = emaVal[0] > emaVal[1];
+   bool isSlopeDown = emaVal[0] < emaVal[1];
+   
+   // Update String Dashboard
+   dashTrendStatus = isPriceAbove ? "BULLISH (M5)" : "BEARISH (M5)";
+   if(isSlopeUp) dashSlopeStatus = "UP (Strong)";
+   else if(isSlopeDown) dashSlopeStatus = "DOWN (Strong)";
+   else dashSlopeStatus = "FLAT (Risky)";
 
-   // --- 3. DOM ANALYSIS ---
+   // --- 5. DOM ANALYSIS ---
    double totalBuyVol = 0;
    double totalSellVol = 0;
    
    if(MarketBookGet(_Symbol, bookInfo)) {
-      int bookSize = ArraySize(bookInfo);
-      for(int i=0; i<bookSize; i++) {
-         if(bookInfo[i].type == BOOK_TYPE_SELL || bookInfo[i].type == BOOK_TYPE_SELL_MARKET)
-            totalSellVol += (double)bookInfo[i].volume;
-         if(bookInfo[i].type == BOOK_TYPE_BUY || bookInfo[i].type == BOOK_TYPE_BUY_MARKET)
-            totalBuyVol += (double)bookInfo[i].volume;
+      int size = ArraySize(bookInfo);
+      if(size > 0) {
+         for(int i=0; i<size; i++) {
+            if(bookInfo[i].type == BOOK_TYPE_SELL || bookInfo[i].type == BOOK_TYPE_SELL_MARKET) totalSellVol += (double)bookInfo[i].volume;
+            if(bookInfo[i].type == BOOK_TYPE_BUY || bookInfo[i].type == BOOK_TYPE_BUY_MARKET) totalBuyVol += (double)bookInfo[i].volume;
+         }
       }
    }
    dashBuyVol = totalBuyVol;
    dashSellVol = totalSellVol;
 
-   // --- 4. FILTERS (PERBAIKAN LOGIKA) ---
-   datetime timeCurrentBar = iTime(_Symbol, PERIOD_M1, 0);
+   // Update Dashboard (Hemat CPU: 1x per detik)
+   if(GetTickCount() - lastDashUpdate > 1000) {
+       UpdateDashboard();
+       lastDashUpdate = GetTickCount();
+   }
+
+   // --- 6. LOGIC & FILTERS ---
+   datetime timeCurrentBar = iTime(_Symbol, PERIOD_CURRENT, 0);
    
-   // [FIX V3.2] HARD LOCK: Jika sudah pernah entry di bar ini (sukses/gagal), stop.
-   if(timeCurrentBar == lastBarTime) {
-      statusMsg = "Candle Locked (Trade Done)";
-      DisplayDashboard();
-      return;
-   }
+   if(timeCurrentBar == lastBarTime) { statusMsg = "Trade Done (Wait Next)"; return; }
+   if(CountOpenPositions() > 0) { statusMsg = "Managing Position"; return; }
+   if(spread > InpMaxSpread) { statusMsg = "Spread High (" + IntegerToString(spread) + ")"; return; }
    
-   // Filter: Posisi Max
-   if(CountOpenPositions() > 0) {
-      statusMsg = "Managing Position...";
-      DisplayDashboard();
-      return;
+   // Filter Volume & DOM
+   if(InpUseVolFilter && (baselineVol > 0 && dashVolPercent < InpVolThreshold)) {
+       statusMsg = "Vol Low (" + DoubleToString(dashVolPercent,1) + "%)"; return;
    }
+   if(totalSellVol < 1 || totalBuyVol < 1) { statusMsg = "DOM Empty"; return; }
 
-   // Filter: Spread & Volume
-   if(spread > InpMaxSpread) { statusMsg = "High Spread: " + IntegerToString(spread); DisplayDashboard(); return; }
-   if(tickVol < InpMinTickVol) { statusMsg = "Low Volume (Sideways)"; DisplayDashboard(); return; }
-
-   // FIX: StopLevel Check
-   long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if(InpStopLoss < stopLevel || InpTakeProfit < stopLevel) {
-      statusMsg = "Error: SL/TP < Broker Limit (" + IntegerToString(stopLevel) + ")";
-      DisplayDashboard();
-      return;
-   }
-
-   // --- 5. EXECUTION ---
-   if(totalSellVol <= 0 || totalBuyVol <= 0) return; 
-
+   // --- 7. EXECUTION ENGINE (WITH ANTI-SPAM) ---
+   
    // ENTRY BUY
-   if(isUptrend && totalBuyVol > (totalSellVol * InpDomRatio))
+   bool signalBuy = isPriceAbove && (InpUseEmaSlope ? isSlopeUp : true);
+   
+   if(signalBuy && totalBuyVol > (totalSellVol * InpDomRatio))
      {
-      statusMsg = ">>> EXECUTING BUY <<<";
-      DisplayDashboard();
-      if(OpenTrade(ORDER_TYPE_BUY)) lastBarTime = timeCurrentBar; // Kunci Bar
+      // Final Spread Check (Microsecond check)
+      if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > InpMaxSpread) return;
+      
+      double lot = CalculateLotSize();
+      if(lot <= 0) return;
+      
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      if(trade.Buy(lot, _Symbol, ask, ask-(InpStopLoss*_Point), ask+(InpTakeProfit*_Point), InpComment)) 
+      {
+          lastBarTime = timeCurrentBar; // Success: Lock Candle
+          statusMsg = "BUY SUCCESS";
+          UpdateDashboard();
+      } 
+      else 
+      {
+          // [ANTI-SPAM LOGIC]
+          int err = GetLastError();
+          Print("BUY FAILED. Error: ", err);
+          
+          // Jika Error Fatal, kunci candle ini agar tidak mencoba lagi
+          if(err == 4756 || err == 10014 || err == 10019) { // Invalid volume, money, etc
+              lastBarTime = timeCurrentBar; 
+              statusMsg = "BUY ERROR (Fatal)";
+          } else {
+              // Jika Error Ringan (Requote/Connection), Cooldown 5 detik
+              executionCooldown = GetTickCount() + 5000;
+              statusMsg = "BUY RETRY in 5s...";
+          }
+      }
      }
+     
    // ENTRY SELL
-   else if(isDowntrend && totalSellVol > (totalBuyVol * InpDomRatio))
+   bool signalSell = !isPriceAbove && (InpUseEmaSlope ? isSlopeDown : true);
+   
+   if(signalSell && totalSellVol > (totalBuyVol * InpDomRatio))
      {
-      statusMsg = ">>> EXECUTING SELL <<<";
-      DisplayDashboard();
-      if(OpenTrade(ORDER_TYPE_SELL)) lastBarTime = timeCurrentBar; // Kunci Bar
-     }
-   else
-     {
-      double ratio = (totalBuyVol > totalSellVol) ? totalBuyVol/totalSellVol : totalSellVol/totalBuyVol;
-      statusMsg = "Scanning... (Ratio: " + DoubleToString(ratio, 1) + "x)";
-      DisplayDashboard();
+      // Final Spread Check
+      if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > InpMaxSpread) return;
+
+      double lot = CalculateLotSize();
+      if(lot <= 0) return;
+
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      if(trade.Sell(lot, _Symbol, bid, bid+(InpStopLoss*_Point), bid-(InpTakeProfit*_Point), InpComment)) 
+      {
+          lastBarTime = timeCurrentBar; // Success: Lock Candle
+          statusMsg = "SELL SUCCESS";
+          UpdateDashboard();
+      } 
+      else 
+      {
+          // [ANTI-SPAM LOGIC]
+          int err = GetLastError();
+          Print("SELL FAILED. Error: ", err);
+          
+          if(err == 4756 || err == 10014 || err == 10019) {
+              lastBarTime = timeCurrentBar;
+              statusMsg = "SELL ERROR (Fatal)";
+          } else {
+              executionCooldown = GetTickCount() + 5000; // Cooldown 5s
+              statusMsg = "SELL RETRY in 5s...";
+          }
+      }
      }
   }
 
 //+------------------------------------------------------------------+
-//| DASHBOARD                                                        |
+//| DASHBOARD & HELPERS                                              |
 //+------------------------------------------------------------------+
-void DisplayDashboard()
+void UpdateDashboard()
   {
-   string text = "=== PEPPERSTONE DOM V3.2 (GOLD MASTER) ===\n";
-   text += "Status: " + statusMsg + "\n";
-   text += "Trend : " + dashTrend + "\n";
-   text += "Spread: " + IntegerToString(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD)) + " pts\n";
-   text += "----------------------------------------\n";
+   orphanTrades = CountOrphanPositions();
+   string text = "=== M1 DOM SCALPER V4.1 (GOLDEN MASTER) ===\n";
+   text += "Status     : " + statusMsg + "\n";
+   text += "---------------------------------\n";
    
-   string domStatus = "Balanced";
+   // Trend
+   text += "[MTF TREND - M5]\n";
+   text += "Direction  : " + dashTrendStatus + "\n";
+   text += "Structure  : " + dashSlopeStatus + "\n";
+   
+   // Volume
+   text += "---------------------------------\n";
+   if(InpUseVolFilter) {
+      text += "[MARKET ACTIVITY]\n";
+      text += "Intensity  : " + DoubleToString(dashVolPercent, 1) + "%";
+      text += (dashVolPercent < InpVolThreshold) ? " (WEAK)" : " (HEALTHY)";
+      text += "\n";
+   }
+   
+   // DOM
+   text += "---------------------------------\n";
+   double ratio = 0;
+   string domState = "Neutral";
    if(dashBuyVol > 0 && dashSellVol > 0) {
-      if(dashBuyVol > dashSellVol) domStatus = "BUYERS (" + DoubleToString(dashBuyVol/dashSellVol, 1) + "x)";
-      else domStatus = "SELLERS (" + DoubleToString(dashSellVol/dashBuyVol, 1) + "x)";
+      if(dashBuyVol > dashSellVol) {
+         ratio = dashBuyVol / dashSellVol;
+         domState = "BUYERS (" + DoubleToString(ratio, 1) + "x)";
+      } else {
+         ratio = dashSellVol / dashBuyVol;
+         domState = "SELLERS (" + DoubleToString(ratio, 1) + "x)";
+      }
    }
-   text += "DOM   : " + domStatus + "\n";
-   text += "Target: > " + DoubleToString(InpDomRatio, 1) + "x\n";
+   text += "[ORDER FLOW]\n";
+   text += "Sentiment  : " + domState + "\n";
+   text += "Target     : > " + DoubleToString(InpDomRatio, 1) + "x\n";
    
-   text += "----------------------------------------\n";
-   if(orphanTrades > 0) {
-      text += "[!] WARNING: " + IntegerToString(orphanTrades) + " TRADE MANUAL/LIAR TERDETEKSI!\n";
-   } else {
-      text += "System Healthy. ID: " + IntegerToString(magicNumber) + "\n";
-   }
+   if(orphanTrades > 0) text += "\n[!] WARNING: " + IntegerToString(orphanTrades) + " Unknown Trades Found!";
    
    Comment(text);
   }
 
-//+------------------------------------------------------------------+
-//| HELPER FUNCTIONS                                                 |
-//+------------------------------------------------------------------+
-int CountOpenPositions()
-  {
-   int count = 0;
-   for(int i=PositionsTotal()-1; i>=0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == magicNumber)
-         count++;
-   }
-   return count;
-  }
-
-int CountOrphanPositions()
-  {
-   int count = 0;
-   for(int i=PositionsTotal()-1; i>=0; i--) {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) != magicNumber)
-         count++;
-   }
-   return count;
-  }
-
-bool OpenTrade(ENUM_ORDER_TYPE type)
-  {
-   double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double sl    = (type == ORDER_TYPE_BUY) ? price - InpStopLoss * _Point : price + InpStopLoss * _Point;
-   double tp    = (type == ORDER_TYPE_BUY) ? price + InpTakeProfit * _Point : price - InpTakeProfit * _Point;
+double CalculateLotSize() {
+   if(!InpUseAutoLot) return InpFixedLot;
+   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
+   double risk = bal * (InpRiskPercent / 100.0);
+   double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(ts==0 || tv==0) return InpFixedLot;
    
-   return trade.PositionOpen(_Symbol, type, InpLotSize, NormalizeDouble(price, _Digits), NormalizeDouble(sl, _Digits), NormalizeDouble(tp, _Digits), eaComment);
-  }
-
-// FIX: SetFillingMode Logic
-bool SetFillingMode()
-  {
-   uint filling = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   // Rumus Akurat Loss
+   double loss = (InpStopLoss*_Point/ts)*tv;
+   if(loss==0) return InpFixedLot;
    
-   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) {
-      trade.SetTypeFilling(ORDER_FILLING_FOK);
-      return true;
-   }
-   if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) {
-      trade.SetTypeFilling(ORDER_FILLING_IOC);
-      return true;
-   }
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double lot = MathFloor((risk/loss)/step) * step;
+   
+   double min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(lot<min) lot=min; if(lot>max) lot=max;
+   return lot;
+}
+
+int CountOpenPositions() {
+   int c=0;
+   for(int i=PositionsTotal()-1; i>=0; i--) 
+      if(PositionGetTicket(i)>0 && PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)==InpMagicNumber) c++;
+   return c;
+}
+
+int CountOrphanPositions() {
+   int c=0;
+   for(int i=PositionsTotal()-1; i>=0; i--) 
+      if(PositionGetTicket(i)>0 && PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)!=InpMagicNumber) c++;
+   return c;
+}
+
+bool SetFillingMode() {
+   uint f = (uint)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   if((f & SYMBOL_FILLING_FOK)==SYMBOL_FILLING_FOK) { trade.SetTypeFilling(ORDER_FILLING_FOK); return true; }
+   if((f & SYMBOL_FILLING_IOC)==SYMBOL_FILLING_IOC) { trade.SetTypeFilling(ORDER_FILLING_IOC); return true; }
    trade.SetTypeFilling(ORDER_FILLING_RETURN);
    return true;
-  }
+}
